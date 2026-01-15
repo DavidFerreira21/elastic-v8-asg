@@ -13,7 +13,7 @@ variable "name_prefix" {
 variable "vpc_id" {
   description = "VPC ID where the instance will run."
   type        = string
-  default     = "vpc-0c0a172abb07f5b16"
+  default     = "vpc-016047663e0ef25e7"
 }
 
 variable "vpc_cidr" {
@@ -25,7 +25,7 @@ variable "vpc_cidr" {
 variable "subnet_id" {
   description = "Subnet ID for the instance."
   type        = string
-  default = "subnet-0934443170b329e8e"
+  default = "subnet-0a25520585372912b"
 }
 
 variable "instance_type" {

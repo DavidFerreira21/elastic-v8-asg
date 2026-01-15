@@ -16,7 +16,7 @@ resource "aws_security_group" "es" {
   })
 }
 
-# Port 9200 only from VPC CIDR or explicitly allowed security groups.
+
 resource "aws_security_group_rule" "es_9200_cidr" {
   count             = length(local.es_9200_cidr_effective)
   type              = "ingress"
@@ -39,7 +39,7 @@ resource "aws_security_group_rule" "es_9200_sg" {
   description              = "Elasticsearch HTTP from SG"
 }
 
-# Optional SSH (prefer SSM).
+
 resource "aws_security_group_rule" "ssh" {
   count             = length(var.ssh_cidr_blocks)
   type              = "ingress"
@@ -106,7 +106,7 @@ resource "aws_iam_instance_profile" "es" {
 
 resource "aws_launch_template" "es" {
   name_prefix   = "${local.name_prefix}-lt-"
-  image_id      = "ami-07ff62358b87c7116"
+  image_id      = "ami-01428df236e9b0b49"
   instance_type = var.instance_type
   key_name      = var.key_name != "" ? var.key_name : null
 
@@ -129,6 +129,7 @@ resource "aws_launch_template" "es" {
   user_data = base64encode(templatefile("${path.module}/userdata.sh", {
     volume_id   = aws_ebs_volume.es_data.id
     device_name = var.data_device_name
+    region = var.aws_region
   }))
 
   tag_specifications {

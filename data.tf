@@ -4,7 +4,7 @@ locals {
 }
 
 # Lookup subnet to place EBS in the same AZ as the instance.
-data "aws_subnet" "selected" {
-  id = var.subnet_id
-}
+#data "aws_subnet" "selected" {
+#  id = var.subnet_id
+#}
 

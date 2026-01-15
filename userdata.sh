@@ -4,15 +4,13 @@ set -euo pipefail
 # Terraform-provided values.
 VOLUME_ID="${volume_id}"
 DEVICE_NAME="${device_name}"
+REGION = ${region}
 
 # Fetch metadata using IMDSv2.
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" \
   -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s \
   http://169.254.169.254/latest/meta-data/instance-id)
-REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s \
-  http://169.254.169.254/latest/dynamic/instance-identity/document | \
-  awk -F"\"" '/region/ {print $4}')
 
 # Ensure we can attach the data volume even on instance replacement.
 ATTACH_STATE=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOLUME_ID" \

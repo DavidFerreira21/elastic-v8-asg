@@ -1,5 +1,5 @@
 resource "aws_ebs_volume" "es_data" {
-  availability_zone = data.aws_subnet.selected.availability_zone
+  availability_zone = "us-east-1a"
   size              = var.es_data_volume_size
   type              = "gp3"
   iops              = var.es_data_volume_iops
