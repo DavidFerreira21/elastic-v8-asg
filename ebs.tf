@@ -4,6 +4,7 @@ resource "aws_ebs_volume" "es_data" {
   type              = "gp3"
   iops              = var.es_data_volume_iops
   throughput        = var.es_data_volume_throughput
+  encrypted         = true
 
 
   tags = merge(var.tags, {

@@ -79,7 +79,13 @@ resource "aws_iam_policy" "es_volume" {
         Effect = "Allow"
         Action = [
           "ec2:AttachVolume",
-          "ec2:DetachVolume",
+          "ec2:DetachVolume"
+        ]
+        Resource = aws_ebs_volume.es_data.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "ec2:DescribeVolumes",
           "ec2:DescribeInstances"
         ]
