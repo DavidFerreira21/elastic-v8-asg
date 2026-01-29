@@ -5,6 +5,7 @@ resource "aws_ebs_volume" "es_data" {
   iops              = var.es_data_volume_iops
   throughput        = var.es_data_volume_throughput
 
+
   tags = merge(var.tags, {
     Name = "${local.name_prefix}-data"
   })
