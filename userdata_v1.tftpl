@@ -17,9 +17,9 @@ ELASTIC_PASSWORD_SECRET_KEY="${elastic_password_secret_key}"
 # -------------------------------------------------------------------
 # Backup config (SLM)
 # -------------------------------------------------------------------
-S3_BACKUP_BUCKET="${s3_backup_bucket:-zapflow-elastic-backups}"
-S3_BACKUP_BASE_PATH="${s3_backup_base_path:-prod/zapflow}"
-SNAPSHOT_REPO_NAME="zapflow-s3-repo"
+S3_BACKUP_BUCKET="${s3_backup_bucket:-asapflow-elastic-backups}"
+S3_BACKUP_BASE_PATH="${s3_backup_base_path:-prod/asapflow}"
+SNAPSHOT_REPO_NAME="asapflow-s3-repo"
 SLM_POLICY_NAME="asapflow-daily"
 SLM_CRON_SCHEDULE="${slm_cron_schedule:-0 0 2 * * ?}"
 SLM_RETENTION_EXPIRE_AFTER="${slm_retention_expire_after:-7d}"
