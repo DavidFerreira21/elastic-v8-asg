@@ -14,7 +14,17 @@ ES_VERSION="8.13.4"
 ELASTIC_PASSWORD_SECRET_ARN="${elastic_password_secret_arn}"
 ELASTIC_PASSWORD_SECRET_KEY="${elastic_password_secret_key}"
 
-
+# -------------------------------------------------------------------
+# Backup config (SLM)
+# -------------------------------------------------------------------
+S3_BACKUP_BUCKET="${s3_backup_bucket:-zapflow-elastic-backups}"
+S3_BACKUP_BASE_PATH="${s3_backup_base_path:-prod/zapflow}"
+SNAPSHOT_REPO_NAME="zapflow-s3-repo"
+SLM_POLICY_NAME="asapflow-daily"
+SLM_CRON_SCHEDULE="${slm_cron_schedule:-0 0 2 * * ?}"
+SLM_RETENTION_EXPIRE_AFTER="${slm_retention_expire_after:-7d}"
+SLM_RETENTION_MIN_COUNT="${slm_retention_min_count:-7}"
+SLM_RETENTION_MAX_COUNT="${slm_retention_max_count:-14}"
 
 [ -n "$VOLUME_ID" ] || { echo "[ERROR] VOLUME_ID vazio"; exit 1; }
 [ -n "$DEVICE_NAME" ] || { echo "[ERROR] DEVICE_NAME vazio"; exit 1; }
@@ -167,6 +177,9 @@ yum install -y "elasticsearch-$ES_VERSION"
 systemctl disable elasticsearch || true
 systemctl stop elasticsearch || true
 
+echo "[INFO] Instalando plugin repository-s3..."
+/usr/share/elasticsearch/bin/elasticsearch-plugin install repository-s3 --batch
+
 # -------------------------------------------------------------------
 # Configuração (single-node, security ON, TLS OFF)
 # -------------------------------------------------------------------
@@ -249,6 +262,33 @@ wait_for_es() {
   done
 }
 
+wait_for_es_health() {
+  local timeout="$${1:-240}"
+  local start_ts now status
+  start_ts=$(date +%s)
+
+  echo "[INFO] Aguardando cluster health (yellow/green)..."
+
+  while true; do
+    status=$(curl -sS -u "elastic:$ELASTIC_PASSWORD" \
+      "http://127.0.0.1:9200/_cluster/health?filter_path=status" \
+      | jq -r '.status // empty' 2>/dev/null || true)
+
+    if [ "$status" = "yellow" ] || [ "$status" = "green" ]; then
+      echo "[INFO] Cluster health: $status"
+      return 0
+    fi
+
+    now=$(date +%s)
+    if [ $(( now - start_ts )) -ge "$timeout" ]; then
+      echo "[ERROR] Timeout aguardando cluster health (status atual: $status)."
+      return 1
+    fi
+
+    sleep 3
+  done
+}
+
 # Garante que o serviço está ativo e HTTP pronto
 if ! systemctl is-active --quiet elasticsearch; then
   echo "[INFO] Elasticsearch não está 'active' ainda. Aguardando 20s..."
@@ -317,6 +357,85 @@ else
   echo "[ERROR] Verificação falhou. HTTP=$VERIFY ao autenticar com a nova senha."
   exit 1
 fi
+
+# -------------------------------------------------------------------
+# CONFIGURAR BACKUP (Snapshot Repository + SLM)
+# -------------------------------------------------------------------
+
+echo "[INFO] Iniciando configuração de backup..."
+
+wait_for_es_health 240 || { echo "[ERROR] Cluster não saudável."; exit 1; }
+
+echo "[INFO] Validando plugin repository-s3..."
+
+PLUGIN_CHECK=$(curl -sS -u "elastic:$ELASTIC_PASSWORD" \
+  "http://127.0.0.1:9200/_cat/plugins?h=component" | grep repository-s3 || true)
+
+if [ -z "$PLUGIN_CHECK" ]; then
+  echo "[ERROR] Plugin repository-s3 não carregado."
+  exit 1
+fi
+
+echo "[SUCCESS] Plugin repository-s3 ativo."
+
+# ------------------------------------------------
+# 1. Aplicar Snapshot Repository (sempre idempotente)
+# ------------------------------------------------
+echo "[INFO] Aplicando snapshot repository..."
+
+curl -sS -u "elastic:$ELASTIC_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  -X PUT "http://127.0.0.1:9200/_snapshot/$SNAPSHOT_REPO_NAME" \
+  -d "{
+    \"type\": \"s3\",
+    \"settings\": {
+      \"bucket\": \"$S3_BACKUP_BUCKET\",
+      \"region\": \"$REGION\",
+      \"base_path\": \"$S3_BACKUP_BASE_PATH\",
+      \"compress\": true
+    }
+  }" >/dev/null
+
+echo "[SUCCESS] Repository aplicado (idempotente)."
+
+
+# ------------------------------------------------
+# 2. Criar/Atualizar Policy SLM (usa variável CRON)
+# ------------------------------------------------
+
+echo "[INFO] Aplicando policy SLM..."
+
+curl -sS -u "elastic:$ELASTIC_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  -X PUT "http://127.0.0.1:9200/_slm/policy/$SLM_POLICY_NAME" \
+  -d "{
+    \"schedule\": \"$SLM_CRON_SCHEDULE\",
+    \"name\": \"<$SLM_POLICY_NAME-{now/d}>\",
+    \"repository\": \"$SNAPSHOT_REPO_NAME\",
+    \"config\": {
+      \"indices\": [\"*\"],
+      \"include_global_state\": false
+    },
+    \"retention\": {
+      \"expire_after\": \"$SLM_RETENTION_EXPIRE_AFTER\",
+      \"min_count\": $SLM_RETENTION_MIN_COUNT,
+      \"max_count\": $SLM_RETENTION_MAX_COUNT
+    }
+  }" >/dev/null
+
+echo "[SUCCESS] Policy SLM aplicada com CRON: $SLM_CRON_SCHEDULE"
+
+
+# ------------------------------------------------
+# 3. Snapshot inicial (opcional)
+# ------------------------------------------------
+
+echo "[INFO] Executando snapshot inicial..."
+
+curl -sS -u "elastic:$ELASTIC_PASSWORD" \
+  -X POST "http://127.0.0.1:9200/_slm/policy/$SLM_POLICY_NAME/_execute" >/dev/null || true
+
+echo "[SUCCESS] Backup configurado."
 
 # Higiene
 unset TMP_PASS SECRET_STRING ELASTIC_PASSWORD PASS_JSON PAYLOAD
