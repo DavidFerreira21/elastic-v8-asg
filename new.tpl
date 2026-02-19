@@ -1,0 +1,322 @@
+#!/bin/bash
+set -euo pipefail
+
+
+echo "[INFO] Starting Elasticsearch bootstrap (Amazon Linux 2 safe)"
+
+# -------------------------------------------------------------------
+# Terraform-provided values
+# -------------------------------------------------------------------
+VOLUME_ID="${volume_id}"
+DEVICE_NAME="${device_name}"       # ex: /dev/sdf (Nitro -> nvme1n1)
+REGION="${region}"
+ES_VERSION="8.13.4"
+ELASTIC_PASSWORD_SECRET_ARN="${elastic_password_secret_arn}"
+ELASTIC_PASSWORD_SECRET_KEY="${elastic_password_secret_key}"
+
+
+
+[ -n "$VOLUME_ID" ] || { echo "[ERROR] VOLUME_ID vazio"; exit 1; }
+[ -n "$DEVICE_NAME" ] || { echo "[ERROR] DEVICE_NAME vazio"; exit 1; }
+[ -n "$REGION" ] || { echo "[ERROR] REGION vazia"; exit 1; }
+[ -n "$ELASTIC_PASSWORD_SECRET_ARN" ] || { echo "[ERROR] ELASTIC_PASSWORD_SECRET_ARN vazio"; exit 1; }
+[ -n "$ELASTIC_PASSWORD_SECRET_KEY" ] || { echo "[ERROR] ELASTIC_PASSWORD_SECRET_KEY vazio"; exit 1; }
+
+# -------------------------------------------------------------------
+# Metadata via IMDSv2
+# -------------------------------------------------------------------
+TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id)
+
+INSTANCE_AZ=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+echo "[INFO] Instance: $INSTANCE_ID  AZ: $INSTANCE_AZ"
+echo "[INFO] Volume:   $VOLUME_ID"
+
+# -------------------------------------------------------------------
+# Pré-requisitos
+# -------------------------------------------------------------------
+yum install -y xfsprogs jq
+
+
+
+echo "[INFO] Instalando AWS CLI v2..."
+yum remove -y awscli || true
+curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip -q awscliv2.zip
+./aws/install
+export PATH=/usr/local/bin:$PATH
+aws --version
+
+
+echo "[INFO] Aguardando credenciais IAM via IMDSv2..."
+
+for i in {1..30}; do
+  if aws sts get-caller-identity >/dev/null 2>&1; then
+    echo "[INFO] Credenciais IAM disponíveis."
+    break
+  fi
+  echo "[INFO] IAM ainda não disponível (tentativa $i/30), aguardando..."
+  sleep 4
+done
+
+aws sts get-caller-identity >/dev/null 2>&1 || {
+  echo "[ERROR] IAM credentials não ficaram disponíveis após timeout."
+  exit 1
+}
+
+# -------------------------------------------------------------------
+# Valida AZ do volume (EBS é zonal)
+# -------------------------------------------------------------------
+VOL_AZ=$(aws ec2 describe-volumes --region "$REGION" \
+  --volume-ids "$VOLUME_ID" --query "Volumes[0].AvailabilityZone" --output text)
+
+if [ "$VOL_AZ" != "$INSTANCE_AZ" ]; then
+  echo "[ERROR] EBS $VOLUME_ID está na $VOL_AZ e a instância na $INSTANCE_AZ. Abortando."
+  exit 1
+fi
+
+# -------------------------------------------------------------------
+# Attach EBS (ASG)
+# -------------------------------------------------------------------
+ATTACHED_TO=$(aws ec2 describe-volumes --region "$REGION" \
+  --volume-ids "$VOLUME_ID" --query "Volumes[0].Attachments[0].InstanceId" \
+  --output text 2>/dev/null || true)
+
+if [ "$ATTACHED_TO" = "$INSTANCE_ID" ]; then
+  echo "[INFO] Volume já anexado a esta instância."
+elif [ -z "$ATTACHED_TO" ] || [ "$ATTACHED_TO" = "None" ]; then
+  echo "[INFO] Anexando volume..."
+  aws ec2 attach-volume --region "$REGION" \
+    --volume-id "$VOLUME_ID" --instance-id "$INSTANCE_ID" --device "$DEVICE_NAME"
+
+  echo "[INFO] Aguardando volume ficar in-use..."
+  aws ec2 wait volume-in-use --region "$REGION" --volume-ids "$VOLUME_ID"
+else
+  echo "[ERROR] Volume $VOLUME_ID anexado a outra instância ($ATTACHED_TO). Abortando."
+  exit 1
+fi
+
+# -------------------------------------------------------------------
+# Detectar device path (Nitro: NVMe por ID; fallback: $DEVICE_NAME)
+# -------------------------------------------------------------------
+echo "[INFO] Detectando device path..."
+DEVICE_PATH=""
+for _ in $(seq 1 60); do
+  if [ -e "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$VOLUME_ID" ]; then
+    DEVICE_PATH=$(readlink -f "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$VOLUME_ID")
+    break
+  fi
+  if [ -e "$DEVICE_NAME" ]; then
+    DEVICE_PATH="$DEVICE_NAME"
+    break
+  fi
+  udevadm settle || true
+  sleep 2
+done
+
+[ -n "$DEVICE_PATH" ] || { echo "[ERROR] Device path não encontrado"; exit 1; }
+echo "[INFO] DEVICE_PATH: $DEVICE_PATH"
+
+# -------------------------------------------------------------------
+# Montar filesystem (XFS) em /var/lib/elasticsearch
+# -------------------------------------------------------------------
+mkdir -p /var/lib/elasticsearch
+
+if ! blkid "$DEVICE_PATH" >/dev/null 2>&1; then
+  echo "[INFO] Formatando volume com XFS..."
+  mkfs.xfs -f "$DEVICE_PATH"
+fi
+
+UUID=$(blkid -o value -s UUID "$DEVICE_PATH")
+if ! grep -q "$UUID" /etc/fstab; then
+  echo "UUID=$UUID /var/lib/elasticsearch xfs defaults,nofail,noatime 0 2" >> /etc/fstab
+fi
+
+mount -a
+mountpoint -q /var/lib/elasticsearch || { echo "[ERROR] Falha ao montar /var/lib/elasticsearch"; exit 1; }
+echo "[INFO] /var/lib/elasticsearch montado."
+
+# -------------------------------------------------------------------
+# Kernel param
+# -------------------------------------------------------------------
+echo "vm.max_map_count=262144" > /etc/sysctl.d/99-elasticsearch.conf
+sysctl -p /etc/sysctl.d/99-elasticsearch.conf
+
+# -------------------------------------------------------------------
+# Repositório e instalação Elasticsearch
+# -------------------------------------------------------------------
+cat >/etc/yum.repos.d/elasticsearch.repo <<'REPO'
+[elasticsearch-8.x]
+name=Elasticsearch repository for 8.x packages
+baseurl=https://artifacts.elastic.co/packages/8.x/yum
+gpgcheck=1
+gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+enabled=1
+autorefresh=1
+type=rpm-md
+REPO
+
+yum install -y "elasticsearch-$ES_VERSION"
+
+# Evita auto-start do RPM
+systemctl disable elasticsearch || true
+systemctl stop elasticsearch || true
+
+# -------------------------------------------------------------------
+# Configuração (single-node, security ON, TLS OFF)
+# -------------------------------------------------------------------
+mkdir -p /var/log/elasticsearch
+chown -R elasticsearch:elasticsearch /var/lib/elasticsearch /var/log/elasticsearch
+
+cat >/etc/elasticsearch/elasticsearch.yml <<CONFIG
+cluster.name: es-asapflow-logs
+node.name: $INSTANCE_ID
+discovery.type: single-node
+
+path.data: /var/lib/elasticsearch
+path.logs: /var/log/elasticsearch
+
+network.host: 0.0.0.0
+http.port: 9200
+
+xpack.security.enabled: true
+xpack.security.enrollment.enabled: false
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false
+CONFIG
+
+chown -R elasticsearch:elasticsearch /etc/elasticsearch
+
+# -------------------------------------------------------------------
+# TMPDIR (compatível com systemd 219 / Amazon Linux 2)
+# -------------------------------------------------------------------
+mkdir -p /etc/systemd/system/elasticsearch.service.d
+cat >/etc/systemd/system/elasticsearch.service.d/override.conf <<'EOF'
+[Service]
+PrivateTmp=false
+PermissionsStartOnly=true
+ExecStartPre=/usr/bin/mkdir -p /var/tmp/elasticsearch-tmp
+ExecStartPre=/usr/bin/chown elasticsearch:elasticsearch /var/tmp/elasticsearch-tmp
+ExecStartPre=/usr/bin/chmod 1777 /var/tmp/elasticsearch-tmp
+Environment="ES_TMPDIR=/var/tmp/elasticsearch-tmp"
+LimitNOFILE=65535
+EOF
+
+cat >/etc/sysconfig/elasticsearch <<'EOF'
+ES_PATH_CONF=/etc/elasticsearch
+ES_TMPDIR=/var/tmp/elasticsearch-tmp
+ES_JAVA_OPTS="-Djava.io.tmpdir=/var/tmp/elasticsearch-tmp -Djansi.tmpdir=/var/tmp/elasticsearch-tmp"
+EOF
+
+# -------------------------------------------------------------------
+# Subir Elasticsearch
+# -------------------------------------------------------------------
+systemctl daemon-reload
+systemctl enable elasticsearch
+systemctl start elasticsearch
+
+echo "[SUCCESS] Elasticsearch online (Security=ON, TLS=OFF)."
+
+
+
+#-------------------------------------------------------------------
+# Reset de senha do 'elastic' (gera TEMP e troca para senha do Secret)
+#-------------------------------------------------------------------
+
+# Função: aguarda Elasticsearch responder (200/401) ou estoura timeout
+wait_for_es() {
+  local timeout="$${1:-240}"
+  local start_ts now code
+  start_ts=$(date +%s)
+  echo "[INFO] Aguardando Elasticsearch responder em http://127.0.0.1:9200 ..."
+  while true; do
+    code=$(curl -s -o /dev/null -w "%%{http_code}" http://127.0.0.1:9200/ || true)
+    if [ "$code" = "200" ] || [ "$code" = "401" ]; then
+      echo "[INFO] Elasticsearch respondeu (HTTP $code)."
+      return 0
+    fi
+    now=$(date +%s)
+    if [ $(( now - start_ts )) -ge "$timeout" ]; then
+      echo "[ERROR] Timeout aguardando Elasticsearch (último HTTP=$code)."
+      return 1
+    fi
+    sleep 3
+  done
+}
+
+# Garante que o serviço está ativo e HTTP pronto
+if ! systemctl is-active --quiet elasticsearch; then
+  echo "[INFO] Elasticsearch não está 'active' ainda. Aguardando 20s..."
+  sleep 20
+fi
+systemctl is-active --quiet elasticsearch || { echo "[ERROR] Elasticsearch não iniciou (systemd)."; exit 1; }
+wait_for_es 240 || { echo "[ERROR] Elasticsearch não ficou pronto a tempo."; exit 1; }
+
+echo "[INFO] Resetando senha TEMP do usuário 'elastic' (modo batch)..."
+RESET_OUT=$(/usr/share/elasticsearch/bin/elasticsearch-reset-password --batch -u elastic -f 2>&1) || {
+  echo "[ERROR] Falha ao rodar elasticsearch-reset-password"
+  echo "$RESET_OUT"
+  exit 1
+}
+
+# Extrai a senha temporária impressa pelo comando
+TMP_PASS=$(echo "$RESET_OUT" | awk -F'New value: ' 'NF>1{print $2}' | tr -d '\r\n')
+[ -n "$TMP_PASS" ] || { echo "[ERROR] Não foi possível capturar a senha temporária do reset-password."; exit 1; }
+
+# Busca a senha final no Secrets Manager 
+echo "[INFO] Buscando senha final no Secrets Manager..."
+SECRET_STRING=$(aws secretsmanager get-secret-value \
+  --region "$REGION" \
+  --secret-id "$ELASTIC_PASSWORD_SECRET_ARN" \
+  --query SecretString --output text) || {
+    echo "[ERROR] Falha ao ler Secret ($ELASTIC_PASSWORD_SECRET_ARN) no Secrets Manager."
+    exit 1
+  }
+
+# Se for JSON, extrai a key; se não, usa o valor puro
+if echo -n "$SECRET_STRING" | jq -e . >/dev/null 2>&1; then
+  ELASTIC_PASSWORD=$(echo -n "$SECRET_STRING" | jq -r --arg k "$ELASTIC_PASSWORD_SECRET_KEY" '.[$k] // empty')
+else
+  ELASTIC_PASSWORD="$SECRET_STRING"
+fi
+[ -n "$ELASTIC_PASSWORD" ] || { 
+  echo "[ERROR] Secret não possui a chave '$ELASTIC_PASSWORD_SECRET_KEY' e não é texto simples."
+  exit 1
+}
+
+# Monta JSON com a senha devidamente escapada
+PASS_JSON=$(printf %s "$ELASTIC_PASSWORD" | jq -R '.')
+PAYLOAD=$(printf '{"password":%s}' "$PASS_JSON")
+
+# Aplica a senha final via API (autenticando com a senha TEMP)
+echo "[INFO] Aplicando senha final via API..."
+HTTP_200=$(curl -sS -o /dev/null -w "%%{http_code}" \
+  -u "elastic:$TMP_PASS" \
+  -H 'Content-Type: application/json' \
+  -X POST "http://127.0.0.1:9200/_security/user/elastic/_password" \
+  -d "$PAYLOAD")
+
+if [ "$HTTP_200" != "200" ]; then
+  echo "[ERROR] Falha ao aplicar a senha final (HTTP $HTTP_200)."
+  exit 1
+fi
+
+# Verifica autenticando com a nova senha
+VERIFY=$(curl -sS -o /dev/null -w "%%{http_code}" \
+  -u "elastic:$ELASTIC_PASSWORD" "http://127.0.0.1:9200/")
+if [ "$VERIFY" = "200" ]; then
+  echo "[SUCCESS] Senha do usuário 'elastic' definida a partir do Secret."
+  sudo iptables -A INPUT -p tcp --dport 9200 -j ACCEPT
+  sudo service iptables save 2>/dev/null || sudo iptables-save | sudo tee /etc/sysconfig/iptables
+else
+  echo "[ERROR] Verificação falhou. HTTP=$VERIFY ao autenticar com a nova senha."
+  exit 1
+fi
+
+# Higiene
+unset TMP_PASS SECRET_STRING ELASTIC_PASSWORD PASS_JSON PAYLOAD
